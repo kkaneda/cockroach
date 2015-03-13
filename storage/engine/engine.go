@@ -188,6 +188,13 @@ func PutProto(engine Engine, key proto.EncodedKey, msg gogoproto.Message) (keyBy
 // key was not found. On success, returns the length in bytes of the
 // key and the value.
 func GetProto(engine Engine, key proto.EncodedKey, msg gogoproto.Message) (ok bool, keyBytes, valBytes int64, err error) {
+	type protoGetter interface {
+		GetProto(key proto.EncodedKey, msg gogoproto.Message) (ok bool, keyBytes, valBytes int64, err error)
+	}
+	if g, ok := engine.(protoGetter); ok {
+		return g.GetProto(key, msg)
+	}
+
 	var data []byte
 	if data, err = engine.Get(key); err != nil {
 		return

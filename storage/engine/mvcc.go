@@ -417,6 +417,19 @@ func MVCCPutProto(engine Engine, ms *MVCCStats, key proto.Key, timestamp proto.T
 	return MVCCPut(engine, ms, key, timestamp, value, txn)
 }
 
+type getBuffer struct {
+	meta   proto.MVCCMetadata
+	value  proto.MVCCValue
+	pvalue proto.Value
+	key    [1024]byte
+}
+
+var getBufferPool = sync.Pool{
+	New: func() interface{} {
+		return &getBuffer{}
+	},
+}
+
 // MVCCGet returns the value for the key specified in the request,
 // while satisfying the given timestamp condition. The key may contain
 // arbitrary bytes. If no value for the key exists, or it has been
@@ -432,7 +445,8 @@ func MVCCPutProto(engine Engine, ms *MVCCStats, key proto.Key, timestamp proto.T
 // keyA_Timestamp_0 : value of version_0
 // keyB : MVCCMetadata of keyB
 // ...
-func MVCCGet(engine Engine, key proto.Key, timestamp proto.Timestamp, txn *proto.Transaction) (*proto.Value, error) {
+func MVCCGet(engine Engine, key proto.Key, timestamp proto.Timestamp,
+	txn *proto.Transaction) (*proto.Value, error) {
 	if len(key) == 0 {
 		return nil, emptyKeyError()
 	}
@@ -448,13 +462,22 @@ func MVCCGet(engine Engine, key proto.Key, timestamp proto.Timestamp, txn *proto
 		return proto.RawKeyValue{}, iter.Error()
 	}
 
-	metaKey := MVCCEncodeKey(key)
+	buf := getBufferPool.Get().(*getBuffer)
+	buf.meta.Reset()
+
+	// TODO(pmattis): Use GetProto and then optimize GetProto to not
+	// copy the data before unmarshalling.
+	metaKey := mvccEncodeKey(buf.key[0:0], key)
 	data, err := engine.Get(metaKey)
 	if err != nil || data == nil {
+		getBufferPool.Put(buf)
 		return nil, err
 	}
 
-	return mvccGetInternal(engine, key, proto.RawKeyValue{Key: metaKey, Value: data}, timestamp, txn, earlier)
+	value, err := mvccGetInternal(engine, key, proto.RawKeyValue{Key: metaKey, Value: data},
+		timestamp, txn, earlier, buf)
+	getBufferPool.Put(buf)
+	return value, err
 }
 
 // getEarlierFunc fetches an earlier version of a key starting at
@@ -468,8 +491,8 @@ type getEarlierFunc func(engine Engine, start, end proto.EncodedKey) (proto.RawK
 // the transaction txn into account. earlier is a helper function to
 // get an earlier version of the value when doing historical reads.
 func mvccGetInternal(engine Engine, key proto.Key, kv proto.RawKeyValue, timestamp proto.Timestamp,
-	txn *proto.Transaction, earlier getEarlierFunc) (*proto.Value, error) {
-	meta := &proto.MVCCMetadata{}
+	txn *proto.Transaction, earlier getEarlierFunc, buf *getBuffer) (*proto.Value, error) {
+	meta := &buf.meta
 	err := gogoproto.Unmarshal(kv.Value, meta)
 	if err != nil {
 		return nil, err
@@ -488,7 +511,7 @@ func mvccGetInternal(engine Engine, key proto.Key, kv proto.RawKeyValue, timesta
 			// intent; the reader will have to act on this.
 			return nil, &proto.WriteIntentError{Key: key, Txn: *meta.Txn}
 		}
-		latestKey := MVCCEncodeVersionKey(key, meta.Timestamp)
+		latestKey := mvccEncodeTimestamp(kv.Key, meta.Timestamp)
 
 		// Check for case where we're reading our own txn's intent
 		// but it's got a different epoch. This can happen if the
@@ -553,11 +576,18 @@ func mvccGetInternal(engine Engine, key proto.Key, kv proto.RawKeyValue, timesta
 		return nil, util.Errorf("expected scan to versioned value reading key %q; got %q", key, kv.Key)
 	}
 
-	// Unmarshal the mvcc value.
-	value := &proto.MVCCValue{}
-	if err := gogoproto.Unmarshal(kv.Value, value); err != nil {
+	// Unmarshal the mvcc value, taking a bit of care to avoid
+	// allocation of the proto.Value struct.
+	value := &buf.value
+	value.Reset()
+	value.Value = &buf.pvalue
+	if err := gogoproto.UnmarshalMerge(kv.Value, value); err != nil {
 		return nil, err
 	}
+	if value.Deleted {
+		value.Value = nil
+	}
+
 	// Set the timestamp if the value is not nil (i.e. not a deletion tombstone).
 	if value.Value != nil {
 		value.Value.Timestamp = &ts
@@ -872,8 +902,14 @@ func MVCCScan(engine Engine, key, endKey proto.Key, max int64, timestamp proto.T
 	if len(endKey) == 0 {
 		return nil, emptyKeyError()
 	}
-	encKey := MVCCEncodeKey(key)
-	encEndKey := MVCCEncodeKey(endKey)
+
+	buf := getBufferPool.Get().(*getBuffer)
+	defer getBufferPool.Put(buf)
+	buf.meta.Reset()
+
+	encEndKey := mvccEncodeKey(buf.key[0:0], endKey)
+	keyBuf := buf.key[len(encEndKey):len(encEndKey)]
+	encKey := mvccEncodeKey(keyBuf, key)
 
 	// Get a new iterator and define our getEarlierFunc using iter.Seek.
 	iter := engine.NewIterator()
@@ -896,7 +932,7 @@ func MVCCScan(engine Engine, key, endKey proto.Key, max int64, timestamp proto.T
 		if isValue {
 			return nil, util.Errorf("expected an MVCC metadata key: %q", kv.Key)
 		}
-		value, err := mvccGetInternal(engine, key, kv, timestamp, txn, earlier)
+		value, err := mvccGetInternal(engine, key, kv, timestamp, txn, earlier, buf)
 		if err != nil {
 			return nil, err
 		}
@@ -906,7 +942,7 @@ func MVCCScan(engine Engine, key, endKey proto.Key, max int64, timestamp proto.T
 				return res, nil
 			}
 		}
-		encKey = MVCCEncodeKey(key.Next())
+		encKey = mvccEncodeKey(keyBuf, key.Next())
 	}
 }
 
